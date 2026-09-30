@@ -1,0 +1,40 @@
+# guard — the repository's own rules, checked on every push.
+#
+# actionlint, shellcheck on scripts/, and tests/test_workflows.py: no
+# pull_request trigger outside the merge gate, the App key read only in the
+# private-source environment, read-only tokens scoped to one repository,
+# pinned actions, one-day artifacts, no xtrace.
+#
+# On push, not pull_request: a push needs write access to this repository,
+# and this job holds nothing but a read-only GITHUB_TOKEN anyway.
+name: guard
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Workflow rules
+        run: python3 -m unittest discover -s tests -v
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+      # The official image, pinned by digest (1.7.12).
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD:/repo" --workdir /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
