@@ -5,7 +5,10 @@
 # away, a deadline hit while this repository's run was still queued. Such a
 # run would name a private SHA and keep its artifacts for their day. This
 # sweep deletes every repository_dispatch run of the two companion workflows
-# that completed more than two hours ago — long after any caller's deadline.
+# older than the callers' longest life:
+#   * completed, and last updated more than two hours ago;
+#   * still queued or in progress three hours after it was created (a caller
+#     gives up after 75 minutes): cancelled, then deleted once completed.
 #
 # Not a workflow_run janitor like supervizio/runner-template's
 # cleanup-external-e2e.yml: deleting a run the moment it completes would race
@@ -38,12 +41,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          cutoff=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)
+          done_cutoff=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)
+          live_cutoff=$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)
+          list() { # workflow status cutoff-field cutoff: every page first, then act
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/$1/runs?event=repository_dispatch&status=$2&per_page=100" \
+              -q ".workflow_runs[] | select(.$3 < \"$4\") | .id"
+          }
           for wf in ktn-native-tests.yml darwin-build.yml; do
-            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf}/runs?event=repository_dispatch&status=completed&per_page=100" \
-              -q ".workflow_runs[] | select(.updated_at < \"${cutoff}\") | .id" |
-              while IFS= read -r rid; do
-                gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}"
-                echo "deleted ${wf} run ${rid}"
-              done
+            # Collected in full before anything is deleted: deleting while
+            # paging shifts the pages and skips runs.
+            stale=$(list "$wf" completed updated_at "$done_cutoff")
+            live=$( { list "$wf" queued created_at "$live_cutoff"; list "$wf" in_progress created_at "$live_cutoff"; } )
+            while IFS= read -r rid; do
+              [ -n "$rid" ] || continue
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}/cancel" >/dev/null || true
+              echo "cancelled ${wf} run ${rid} (abandoned); the next sweep deletes it"
+            done <<< "$live"
+            while IFS= read -r rid; do
+              [ -n "$rid" ] || continue
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}"
+              echo "deleted ${wf} run ${rid}"
+            done <<< "$stale"
           done
