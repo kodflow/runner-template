@@ -103,6 +103,34 @@ class RunTestBinaries(unittest.TestCase):
 
 
 class FetchSource(unittest.TestCase):
+    def test_fetches_without_leaving_the_token_behind(self):
+        # github.com is redirected to a local bare repository through a
+        # throwaway global config, so the real script runs offline.
+        token = "tok-" + SECRET
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a, cwd=tmp: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True)
+            git("init", "-q", "src")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x", cwd=os.path.join(tmp, "src"))
+            sha = git("rev-parse", "HEAD", cwd=os.path.join(tmp, "src")).stdout.strip()
+            git("clone", "-q", "--bare", "src", "bare.git")
+            gitconfig = os.path.join(tmp, "gitconfig")
+            with open(gitconfig, "w", encoding="utf-8") as fh:
+                fh.write(f'[url "file://{tmp}/bare.git"]\n\tinsteadOf = https://github.com/kodflow/x.git\n')
+            dest = os.path.join(tmp, "dest")
+            r = run("fetch-source.sh", "kodflow/x", sha, dest,
+                    env={"SOURCE_TOKEN": token, "GIT_CONFIG_GLOBAL": gitconfig})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(git("rev-parse", "HEAD", cwd=dest).stdout.strip(), sha)
+            self.assertNotIn(token, r.stdout + r.stderr)
+            # Only the mask directive may carry the encoded form.
+            for line in r.stdout.splitlines():
+                if "::add-mask::" not in line:
+                    self.assertNotIn("x-access-token", line)
+            with open(os.path.join(dest, ".git", "config"), encoding="utf-8") as fh:
+                config = fh.read()
+            self.assertNotIn(token, config)
+            self.assertNotIn("extraheader", config.lower())
+
     def test_refuses_to_run_without_a_token(self):
         with tempfile.TemporaryDirectory() as tmp:
             env = {k: v for k, v in os.environ.items() if k != "SOURCE_TOKEN"}
