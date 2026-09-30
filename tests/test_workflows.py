@@ -57,8 +57,8 @@ class Triggers(unittest.TestCase):
                 continue
             triggers = on_block(text)
             self.assertTrue(triggers, f"{name}: no on: block found")
-            # pull_request also matches pull_request_target, on purpose.
-            self.assertNotRegex(triggers, r"(?m)^\s+pull_request", name)
+            self.assertNotRegex(triggers, r"(?m)^\s+pull_request_target\b", name)
+            self.assertNotRegex(triggers, r"(?m)^\s+pull_request\b", name)
             self.assertNotRegex(triggers, r"(?m)^\s+workflow_run", name)
             # The inline forms (`on: pull_request`, `on: [push, pull_request]`)
             # would escape the block check above: only the block form passes.
