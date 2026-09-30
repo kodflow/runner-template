@@ -28,6 +28,11 @@ def code(text):
     )
 
 
+def secret_refs(text, name):
+    """Every reference to a secret, dotted or indexed (secrets['NAME'])."""
+    return re.findall(r"secrets(?:\.%s\b|\[\s*['\"]%s['\"]\s*\])" % (name, name), code(text))
+
+
 def workflows():
     for name in sorted(os.listdir(WORKFLOWS)):
         if name.endswith((".yml", ".yaml")):
@@ -52,8 +57,12 @@ class Triggers(unittest.TestCase):
                 continue
             triggers = on_block(text)
             self.assertTrue(triggers, f"{name}: no on: block found")
+            # pull_request also matches pull_request_target, on purpose.
             self.assertNotRegex(triggers, r"(?m)^\s+pull_request", name)
             self.assertNotRegex(triggers, r"(?m)^\s+workflow_run", name)
+            # The inline forms (`on: pull_request`, `on: [push, pull_request]`)
+            # would escape the block check above: only the block form passes.
+            self.assertNotRegex(code(text), r"(?m)^on:[ \t]*[^\s#]", name)
 
     def test_companions_are_dispatch_only(self):
         for name in ("ktn-native-tests.yml", "darwin-build.yml"):
@@ -71,13 +80,13 @@ class AppKeyStaysInTheEnvironment(unittest.TestCase):
     def test_no_personal_token_secret(self):
         for name, text in workflows():
             for secret in RETIRED:
-                self.assertNotIn("secrets." + secret, code(text), name)
+                self.assertEqual(secret_refs(text, secret), [], name)
 
     def test_the_key_is_read_only_in_the_environment(self):
         seen = 0
         for wf, text in workflows():
             for name, job in jobs(text).items():
-                if "secrets.CI_APP_PRIVATE_KEY" not in job:
+                if not secret_refs(job, "CI_APP_PRIVATE_KEY"):
                     continue
                 seen += 1
                 envs = re.findall(r"^    environment: .*$", job, re.M)
@@ -102,11 +111,8 @@ class AppKeyStaysInTheEnvironment(unittest.TestCase):
                     # is the run's conclusion, which the caller reads.
                     self.assertEqual(level, "read", f"{wf}: permission-{perm}")
             self.assertEqual(text.count("uses: actions/create-github-app-token@"), text.count(APP_TOKEN_PIN), wf)
-            self.assertNotIn(
-                "secrets.CI_APP_PRIVATE_KEY",
-                code(text).replace("private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}", ""),
-                wf,
-            )
+            outside = code(text).replace("private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}", "")
+            self.assertEqual(secret_refs(outside, "CI_APP_PRIVATE_KEY"), [], wf)
         self.assertGreaterEqual(steps, 3)
 
 
