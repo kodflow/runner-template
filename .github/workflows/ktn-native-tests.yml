@@ -148,6 +148,12 @@ jobs:
           REPORT_DIR: ${{ runner.temp }}/report
           SPECS: ${{ matrix.specs }}
         run: |
+          # runner.temp is a native path (D:\a\_temp on Windows): hand Git
+          # Bash its own form of it rather than rely on MSYS guessing.
+          if command -v cygpath >/dev/null 2>&1; then
+            BIN_DIR=$(cygpath -u "$BIN_DIR")
+            REPORT_DIR=$(cygpath -u "$REPORT_DIR")
+          fi
           read -r -a specs <<< "$SPECS"
           scripts/run-test-binaries.sh "$BIN_DIR" "$REPORT_DIR" "${specs[@]}"
 
