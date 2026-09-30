@@ -1,0 +1,162 @@
+# ktn-native-tests — run test binaries compiled by kodflow/ktn-linter
+# (private) on real macOS and Windows kernels.
+#
+# ktn-linter's self-hosted runners are Linux pods: its [macos] and [windows]
+# lanes can only cross-compile `go test -c` binaries. Its `native` job then
+# dispatches this workflow with a request id, finds this run by its title,
+# waits for it, downloads the reports, prints them in its own private log,
+# and DELETES this run with its own token. Nothing stays public once it has
+# been brought back.
+#
+# What reaches this repository: the test binaries, downloaded from the
+# ktn-linter run. Never its source. What leaves a job: one ok/FAIL line per
+# binary in this log, and the binaries' output as a report artifact (one day
+# at most, and gone with the run).
+#
+# Triggers: repository_dispatch and workflow_dispatch only, never
+# pull_request: the test jobs hold a token that reads a private repository.
+# See README.md for the threat model.
+name: ktn-native-tests
+# The caller finds its run by this exact title: `ktn-native-tests <request id>`.
+run-name: ktn-native-tests ${{ github.event.client_payload.request_id || inputs.request_id }}
+
+on:
+  repository_dispatch:
+    types: [ktn-native-tests]
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Request id, `<run id>-<run attempt>-<label>` (a manual run is looked for by no one)
+        required: true
+      run_id:
+        description: ktn-linter CI run id holding the license-tests-* artifacts
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: ktn-native-tests-${{ github.event.client_payload.request_id || inputs.request_id }}
+  cancel-in-progress: true
+
+jobs:
+  # No credential here. Everything the payload says is untrusted text until
+  # this job has checked it, and it is read through env, never pasted into a
+  # script by the template engine. Only a token with write access to this
+  # repository can dispatch, but the check keeps a leaked one from steering
+  # the token below at anything but ktn-linter's artifacts.
+  admit:
+    name: admit
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      run_id: ${{ steps.admit.outputs.run_id }}
+    steps:
+      - name: Admit the dispatch
+        id: admit
+        env:
+          EVENT: ${{ github.event_name }}
+          PAYLOAD_REPO: ${{ github.event.client_payload.source_repo }}
+          PAYLOAD_REQ: ${{ github.event.client_payload.request_id }}
+          PAYLOAD_RUN: ${{ github.event.client_payload.run_id }}
+          INPUT_REQ: ${{ inputs.request_id }}
+          INPUT_RUN: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            repo=kodflow/ktn-linter req=$INPUT_REQ run=$INPUT_RUN
+          else
+            repo=${PAYLOAD_REPO:-} req=${PAYLOAD_REQ:-} run=${PAYLOAD_RUN:-}
+          fi
+          [ "$repo" = kodflow/ktn-linter ] || { echo "::error::this workflow serves kodflow/ktn-linter only"; exit 1; }
+          [[ "$req" =~ ^[0-9]{1,20}-[0-9]{1,4}-[a-z0-9-]{1,40}$ ]] || { echo "::error::request_id must be <run id>-<run attempt>-<label>"; exit 1; }
+          [[ "$run" =~ ^[0-9]{1,20}$ ]] || { echo "::error::run_id must be numeric"; exit 1; }
+          # The request id names the ktn-linter run it serves; one whose id and
+          # run disagree is refused rather than attributed to either.
+          [ "${req%%-*}" = "$run" ] || { echo "::error::request_id does not start with run_id"; exit 1; }
+          echo "run_id=$run" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ matrix.leg }}
+    needs: admit
+    runs-on: ${{ matrix.runner }}
+    # The kodflow-ci App's key (secrets.CI_APP_PRIVATE_KEY) lives in this
+    # environment, which deploys from main only: a workflow_dispatch of
+    # another branch never reaches it.
+    environment: private-source
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The lane ktn-linter ran on macos-latest before the move: the
+          # licence package on Apple Silicon.
+          - leg: macos-arm64
+            runner: macos-latest
+            artifact: license-tests-darwin
+            dir: darwin-arm64
+            specs: license.test
+          # The amd64 binary is built anyway; an Intel kernel runs it.
+          - leg: macos-amd64
+            runner: macos-15-intel
+            artifact: license-tests-darwin
+            dir: darwin-amd64
+            specs: license.test
+          # The former windows-latest lane: the licence package, and the
+          # daemon's Windows instance-lock tests (`-run Windows`).
+          - leg: windows-amd64
+            runner: windows-latest
+            artifact: license-tests-windows
+            dir: windows-amd64
+            specs: license.test.exe serve.test.exe:Windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # This repository only, for scripts/. Nothing private is checked out.
+      - name: Checkout runner-template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A kodflow-ci App installation token, minted here (the only place the
+      # App's key can be read): one repository, the permissions this job uses,
+      # revoked by the action's post step when the job ends.
+      - name: Token for kodflow/ktn-linter (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: kodflow
+          repositories: ktn-linter
+          permission-actions: read
+
+      - name: Download the test binaries from the ktn-linter run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/bin
+          repository: kodflow/ktn-linter
+          run-id: ${{ needs.admit.outputs.run_id }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Run the test binaries
+        env:
+          BIN_DIR: ${{ runner.temp }}/bin/${{ matrix.dir }}
+          REPORT_DIR: ${{ runner.temp }}/report
+          SPECS: ${{ matrix.specs }}
+        run: |
+          read -r -a specs <<< "$SPECS"
+          scripts/run-test-binaries.sh "$BIN_DIR" "$REPORT_DIR" "${specs[@]}"
+
+      # Uploaded red or green: a failure is exactly when the caller needs it.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ktn-native-${{ matrix.leg }}
+          path: ${{ runner.temp }}/report/
+          retention-days: 1
+          if-no-files-found: ignore
