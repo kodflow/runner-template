@@ -169,6 +169,24 @@ class Reusable(unittest.TestCase):
                     self.assertIn("ref: ${{ inputs.ref }}", block, name)
 
 
+# The one place a stub names the key: its job calls a reusable workflow here
+# at a full SHA and hands the key over by name, because a called workflow
+# reads only the secrets it declares and `inherit` does not cross owners. The
+# value is empty at that level (the key lives only in the environment); the
+# called jobs naming `private-source` read the environment's key.
+STUB_CALL = re.compile(r"(?m)^    uses: kodflow/runner-template/\.github/workflows/reusable-[a-z0-9-]+\.yml@[0-9a-f]{40}$")
+STUB_PASS = "    secrets:\n      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}"
+
+
+def key_outside_stub_pass(job):
+    """The job's code with its stub hand-over removed, when it is a stub call
+    and passes the key exactly so. Anything else keeps every reference."""
+    body = code(job)
+    if STUB_CALL.search(body) and body.count(STUB_PASS) == 1:
+        body = body.replace(STUB_PASS, "")
+    return body
+
+
 class AppKeyStaysInTheEnvironment(unittest.TestCase):
     """The kodflow-ci App's key is the only credential this repository holds on
     the private ones. Only jobs of the `private-source` environment (main
@@ -184,7 +202,7 @@ class AppKeyStaysInTheEnvironment(unittest.TestCase):
         seen = 0
         for wf, text in workflows():
             for name, job in jobs(text).items():
-                if not secret_refs(job, "CI_APP_PRIVATE_KEY"):
+                if not secret_refs(key_outside_stub_pass(job), "CI_APP_PRIVATE_KEY"):
                     continue
                 seen += 1
                 envs = re.findall(r"^    environment: .*$", job, re.M)
@@ -212,9 +230,27 @@ class AppKeyStaysInTheEnvironment(unittest.TestCase):
                     # is the run's conclusion, which the caller reads.
                     self.assertEqual(level, "read", f"{wf}: permission-{perm}")
             self.assertEqual(text.count("uses: actions/create-github-app-token@"), text.count(APP_TOKEN_PIN), wf)
-            outside = code(text).replace("private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}", "")
+            outside = "\n".join(key_outside_stub_pass(job) for job in jobs(text).values())
+            outside = outside.replace("private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}", "")
             self.assertEqual(secret_refs(outside, "CI_APP_PRIVATE_KEY"), [], wf)
         self.assertGreaterEqual(steps, 3)
+
+    def test_only_a_stub_hand_over_is_excused(self):
+        sha = "0" * 40
+        call = f"    uses: kodflow/runner-template/.github/workflows/reusable-selftest.yml@{sha}\n"
+        ok = call + STUB_PASS + "\n"
+        self.assertEqual(secret_refs(key_outside_stub_pass(ok), "CI_APP_PRIVATE_KEY"), [])
+        refused = {
+            "not a stub call": "    runs-on: ubuntu-latest\n" + STUB_PASS + "\n",
+            "a call on a branch": call.replace(sha, "main") + STUB_PASS + "\n",
+            "a call elsewhere": call.replace("kodflow/runner-template", "someone/else") + STUB_PASS + "\n",
+            "handed over twice": ok + "    secrets:\n      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}\n",
+            "read in a step too": ok + "        env:\n          K: ${{ secrets.CI_APP_PRIVATE_KEY }}\n",
+            "under another name": call + "    secrets:\n      OTHER: ${{ secrets.CI_APP_PRIVATE_KEY }}\n",
+        }
+        for why, job in refused.items():
+            with self.subTest(why):
+                self.assertNotEqual(secret_refs(key_outside_stub_pass(job), "CI_APP_PRIVATE_KEY"), [], why)
 
 
 class Hygiene(unittest.TestCase):
