@@ -61,10 +61,10 @@ jobs see the key. `run-name:` and `concurrency:` of a
 called workflow are ignored: the stub sets both (the private caller finds its
 run by that title).
 
-This repository's own companion workflows (`darwin-build.yml`,
-`ktn-native-tests.yml`, `sweep.yml`) are kodflow's stubs once `enforce` has
-synced them; until then they are the pre-centralisation copies, so the
-callers keep working through the switch. [`guard.yml`](.github/workflows/guard.yml)
+This repository is also kodflow's runner-template: `darwin-build.yml`,
+`ktn-native-tests.yml`, `selftest.yml` and `sweep.yml` here are kodflow's
+stubs, written and kept in sync by `enforce` like every other owner's.
+[`guard.yml`](.github/workflows/guard.yml)
 (actionlint, shellcheck, `tests/`) and
 [`post-commit.yml`](.github/workflows/post-commit.yml) (the fleet's merge
 gate) are this repository's own.
