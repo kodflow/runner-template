@@ -74,10 +74,26 @@ class Triggers(unittest.TestCase):
             self.assertNotRegex(code(text), r"(?m)^on:[ \t]*[^\s#]", name)
 
     def test_companions_are_dispatch_only(self):
+        # The pre-centralisation copies also took workflow_dispatch; the stubs
+        # enforce writes in their place take repository_dispatch alone.
         for name in ("ktn-native-tests.yml", "darwin-build.yml"):
             with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as fh:
                 keys = set(re.findall(r"^  ([a-z_]+):", on_block(fh.read()), re.M))
-            self.assertEqual(keys, {"repository_dispatch", "workflow_dispatch"}, name)
+            self.assertIn("repository_dispatch", keys, name)
+            self.assertLessEqual(keys, {"repository_dispatch", "workflow_dispatch"}, name)
+
+    def test_stubs_pass_their_own_pin(self):
+        # A stub here (kodflow's, written by kodflow/post-commit's enforce)
+        # calls this repository at a full SHA and hands the same SHA over as
+        # `ref`, or the called jobs would read scripts of another commit.
+        for name, text in workflows():
+            pins = re.findall(r"uses: kodflow/runner-template/\.github/workflows/reusable-[a-z0-9-]+\.yml@([0-9a-f]{40})$", code(text), re.M)
+            if not pins:
+                continue
+            self.assertEqual(len(pins), 1, name)
+            refs = re.findall(r"^      ref: ([0-9a-f]{40})$", code(text), re.M)
+            self.assertIn(refs, ([], pins), name)
+            self.assertNotRegex(code(text), r"secrets|environment:", name)
 
 
 class Reusable(unittest.TestCase):
