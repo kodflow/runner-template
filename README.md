@@ -50,7 +50,14 @@ commit here goes out with `scripts/bump-runner-template.sh <sha>` there.
 **What a stub cannot carry.** `environment:` is not allowed on a job that
 `uses:` a workflow, so every job that reads the key names
 `environment: private-source` here, inside the reusable workflow; GitHub
-resolves it in the calling repository. `run-name:` and `concurrency:` of a
+resolves it in the calling repository. A called workflow also reads only the
+secrets it declares, and `secrets: inherit` does not cross owners: each
+reusable workflow that reads the key declares `CI_APP_PRIVATE_KEY` under
+`on.workflow_call.secrets`, and each stub passes
+`CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}`. At the stub's level
+that value is empty (the key exists only in the environment); in a job naming
+the environment GitHub uses the environment's secret instead, so only those
+jobs see the key. `run-name:` and `concurrency:` of a
 called workflow are ignored: the stub sets both (the private caller finds its
 run by that title).
 

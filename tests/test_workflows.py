@@ -93,7 +93,14 @@ class Triggers(unittest.TestCase):
             self.assertEqual(len(pins), 1, name)
             refs = re.findall(r"^      ref: ([0-9a-f]{40})$", code(text), re.M)
             self.assertIn(refs, ([], pins), name)
-            self.assertNotRegex(code(text), r"secrets|environment:", name)
+            # The one secret a stub may name is the App key, handed over by
+            # name so the called workflow can read it at all; never inherit,
+            # never another, and no environment (a `uses:` job takes none).
+            passed = re.findall(r"secrets\.([A-Za-z0-9_]+)", code(text))
+            self.assertIn(passed, ([], ["CI_APP_PRIVATE_KEY"]), name)
+            if passed:
+                self.assertRegex(code(text), r"(?m)^    secrets:\n      CI_APP_PRIVATE_KEY: \$\{\{ secrets\.CI_APP_PRIVATE_KEY \}\}$", name)
+            self.assertNotRegex(code(text), r"secrets: inherit|environment:", name)
 
 
 class Reusable(unittest.TestCase):
@@ -145,6 +152,15 @@ class Reusable(unittest.TestCase):
             for other, body in jobs(text).items():
                 if other != "admit":
                     self.assertRegex(body, r"(?m)^    needs: \[?admit\]?$", f"{name}:{other}")
+
+    def test_the_key_is_declared_where_it_is_read(self):
+        # A called workflow reads only the secrets it declares (inherit does
+        # not cross owners): one that reads the key without declaring it gets
+        # an empty string, and its token step fails on every dispatch.
+        for name, text in self.reusables():
+            reads = "secrets.CI_APP_PRIVATE_KEY" in code(text)
+            declared = re.search(r"(?m)^    secrets:\n      CI_APP_PRIVATE_KEY:\n(?:        .*\n)*        required: false$", on_block(text)) is not None
+            self.assertEqual(reads, declared, name)
 
     def test_runner_template_is_checked_out_at_the_pin(self):
         for name, text in self.reusables():

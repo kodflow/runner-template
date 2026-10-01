@@ -47,6 +47,15 @@ on:
         description: Each leg's report artifact is `<report_prefix><leg>`, the name the caller downloads
         required: true
         type: string
+    # Declared, or a called workflow cannot read it at all (`secrets: inherit`
+    # does not cross owners). The stub passes its own value, which is empty:
+    # the key lives only in the caller's `private-source` environment, and in
+    # a job naming that environment GitHub uses the environment's secret, not
+    # the one passed. So only those jobs ever see it.
+    secrets:
+      CI_APP_PRIVATE_KEY:
+        description: The kodflow-ci App key; read from the caller's private-source environment
+        required: false
 
 permissions: {}
 
