@@ -1,0 +1,732 @@
+# =============================================================================
+# THE ONE PRODUCER OF agent's BSD, macOS AND CHOCOLATEY PACKAGES.
+#
+# agent is private and pays for every hosted minute; this repository is public
+# and does not. agent cross-compiles every one of these binaries on its own
+# self-hosted runner; what needs a real system is the PACKAGING TOOL, so that
+# is all that runs here:
+#
+#   freebsd-amd64   `pkg create` in a FreeBSD 15.1 guest
+#   netbsd-amd64    `pkg_create` in a NetBSD 10.1 guest
+#   openbsd-amd64   build-pkg.sh's tarball, digests from `sha256 -b`, in an
+#   openbsd-arm64   OpenBSD 7.8 guest (the sysroot both binaries link against)
+#   macos-amd64     pkgbuild on macos-15-intel
+#   macos-arm64     pkgbuild on macos-15
+#   windows-amd64   choco pack, then the full SCM install cycle, windows-2025
+#   windows-arm64   the .zip layout through the SCM cycle, windows-11-arm
+#                   (advisory: it produces nothing and never fails the run)
+#   illumos-amd64   the IPS archive (.p5p) in an OmniOS r151054 guest
+#   solaris-amd64   the IPS archive (.p5p) in an Oracle Solaris 11.4 guest
+#                   (pkgsend, pkgrepo, pkgrecv and pkgdepend exist only on
+#                   these kernels). Before packaging, the guest runs the
+#                   binary (--version, --probe) and agent's cross-built Go
+#                   test binaries of its illumos/Solaris-specific packages;
+#                   after, it installs the archive and checks SMF runs it.
+#
+# Every package is installed where it was built, as a user would, before it is
+# uploaded (pkg_add / pkg install through setup/install.sh, installer(8), the
+# choco cycle). A package that does not install never leaves this run.
+#
+# A REUSABLE workflow. It runs only when supervizio's runner-template stub
+# (.github/workflows/agent-packages.yml there, on repository_dispatch
+# `build-agent-packages`) calls it, so the run, its log, its artifacts, the
+# `private-source` environment and the App key below are all
+# supervizio/runner-template's. The logic lives here, in
+# kodflow/runner-template, and nowhere else; see README.md.
+#
+# WHO CALLS IT. agent's `.github/workflows/public-packages.yml`, and nothing
+# else: ci.yml's `package-openbsd` (both OpenBSD arches, every pull request
+# that builds OpenBSD) and `package-solarish`, and release.yml's
+# `build-bsd-packages`, `build-solarish-packages` and
+# `build-desktop-packages`. CI and a release therefore receive their packages
+# from this one file, never from two producers under one name. agent
+# dispatches `build-agent-packages`, finds this run by its run-name (the
+# request id it chose), waits for it, and downloads the packages from it.
+#
+# WHAT IT READS FROM agent, and nothing more:
+#   * the cross-built binaries, downloaded from the agent run that asked, and
+#     for illumos/Solaris the `go test -c` binaries (`solarish-tests-*`);
+#   * a SPARSE checkout of the requesting commit: `setup/`,
+#     `examples/config.yaml`, `LICENSE`, `e2e/test-install.ps1`,
+#     `.github/scripts/bsd-package-in-guest.sh` and
+#     `.github/scripts/solarish-package-in-guest.sh`. All but the last two
+#     already ship in every release as `e2e-kit.tar.gz`; those two are the
+#     packaging wrappers the guests run. None of agent's Go sources are ever
+#     checked out here.
+#   These scripts are not vendored into this repository on purpose: they
+#   package the tree they sit in, so they are read at the commit being
+#   packaged, and a copy here would drift from the build-pkg.sh it wraps.
+#
+# SECURITY MODEL (a public workflow holding a credential to a private repo):
+#   * repository_dispatch and workflow_dispatch only. Never pull_request or
+#     pull_request_target: a fork's code can never run next to the token.
+#   * No personal token. The jobs that read agent run in the `private-source`
+#     ENVIRONMENT (deployment branches: `main` only), the only place the
+#     kodflow-ci GitHub App's key (CI_APP_PRIVATE_KEY, with vars.CI_APP_CLIENT_ID) can
+#     be read, and mint there a token for supervizio/agent alone, contents:
+#     read + actions: read, revoked when the job ends. Only the two steps that
+#     need it read it (checkout, download); it is never exported to the job,
+#     never persisted in the checkout (persist-credentials: false), never
+#     synced into a guest.
+#   * The requested commit, run id and request id are validated in `admit`
+#     before any job holds the token; the repository is not an input at all.
+#   * Only packages leave: each upload is the package directory, nothing of
+#     the checkout. No step prints a source file. The illumos/Solaris guest
+#     keeps its detailed output inside the guest (/var/tmp, never synced
+#     back); the log shows its `=== ` stage lines and the verdict only.
+#   * Nothing here writes to agent: the verdict is this run's conclusion,
+#     which agent reads from the public API. The token stays read-only.
+#   * The run does not outlive its use: agent deletes it right after
+#     downloading the packages (public-packages.yml), success or not. The
+#     one-day artifact retention below is only a net under that.
+# =============================================================================
+
+# The run-name agent looks for (`agent-packages <request id>`) and the
+# concurrency group are the stub's: a called workflow's own are ignored.
+name: Agent packages
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit of kodflow/runner-template the stub pins (the same SHA as its `uses:`)
+        required: true
+        type: string
+      payload:
+        description: >-
+          The dispatch payload as JSON (the stub passes toJSON of it): request_id, sha, run_id,
+          version_num (no v prefix; 0.0.0 when absent), only (space-separated
+          subset of freebsd-amd64 netbsd-amd64 openbsd-amd64 openbsd-arm64
+          macos-amd64 macos-arm64 windows-amd64 windows-arm64 illumos-amd64
+          solaris-amd64; empty = all of them)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  # Every value above came from whoever holds a dispatch token, so it is
+  # checked HERE, by a job that holds no credential at all, before anything
+  # that does is allowed to start. Read through env, never interpolated into
+  # the script: a payload is text, and a newline in $GITHUB_OUTPUT would let
+  # it set outputs of its own.
+  admit:
+    name: Admit the request
+    runs-on: ubuntu-26.04
+    permissions: {}
+    outputs:
+      sha: ${{ steps.admit.outputs.sha }}
+      run_id: ${{ steps.admit.outputs.run_id }}
+      version_num: ${{ steps.plan.outputs.version_num }}
+      bsd: ${{ steps.plan.outputs.bsd }}
+      desktop: ${{ steps.plan.outputs.desktop }}
+      solarish: ${{ steps.plan.outputs.solarish }}
+      windows_arm64: ${{ steps.plan.outputs.windows_arm64 }}
+    steps:
+      # Anonymous: this job holds no credential, not even to read a public
+      # repository. scripts/admit.sh at the pinned commit, and nothing else.
+      - name: Fetch admit.sh
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-hex commit of kodflow/runner-template"; exit 1; }
+          git init -q rt
+          git -C rt fetch -q --depth=1 https://github.com/kodflow/runner-template.git "$REF"
+          git -C rt -c advice.detachedHead=false checkout -q FETCH_HEAD
+
+      # The request id names the agent run it serves; a request whose id and
+      # run disagree is refused rather than attributed to either.
+      - name: Validate the request
+        id: admit
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: >-
+          rt/scripts/admit.sh
+          --run-starts-request
+          'request_id=[0-9]{1,20}-[0-9]{1,4}-[a-z]{1,20}'
+          'sha=[0-9a-f]{40}'
+          'run_id=[0-9]{1,20}'
+          'version_num?=([0-9]+[.][0-9]+[.][0-9]+([.+~-][0-9A-Za-z.]+)?)?'
+          'only?=[a-z0-9 -]{0,400}'
+
+      - name: Split it by runner family
+        id: plan
+        env:
+          REQUEST_ID: ${{ steps.admit.outputs.request_id }}
+          SOURCE_SHA: ${{ steps.admit.outputs.sha }}
+          SOURCE_RUN_ID: ${{ steps.admit.outputs.run_id }}
+          VERSION_NUM: ${{ steps.admit.outputs.version_num || '0.0.0' }}
+          ONLY: ${{ steps.admit.outputs.only }}
+        run: |
+          set -euo pipefail
+          echo "version_num=$VERSION_NUM" >> "$GITHUB_OUTPUT"
+
+          # vm_arch keeps both OpenBSD arches on one `uses:` step: the action
+          # normalises x86_64 to its default. Every BSD entry carries it so all
+          # have one shape.
+          bsd='[
+            {"platform":"freebsd-amd64","os":"freebsd","vm_arch":"x86_64","artifact":"supervizio-freebsd-amd64","pkg_artifact":"supervizio-freebsd-pkg"},
+            {"platform":"netbsd-amd64","os":"netbsd","vm_arch":"x86_64","artifact":"supervizio-netbsd-amd64","pkg_artifact":"supervizio-netbsd-pkg"},
+            {"platform":"openbsd-amd64","os":"openbsd","vm_arch":"x86_64","artifact":"supervizio-openbsd-amd64","pkg_artifact":"supervizio-openbsd-amd64-pkg"},
+            {"platform":"openbsd-arm64","os":"openbsd","vm_arch":"aarch64","artifact":"supervizio-openbsd-arm64","pkg_artifact":"supervizio-openbsd-arm64-pkg"}
+          ]'
+          desktop='[
+            {"platform":"macos-amd64","os":"macos","arch":"amd64","runner":"macos-15-intel","artifact":"supervizio-darwin-amd64","pkg_artifact":"supervizio-macos-amd64-pkg"},
+            {"platform":"macos-arm64","os":"macos","arch":"arm64","runner":"macos-15","artifact":"supervizio-darwin-arm64","pkg_artifact":"supervizio-macos-arm64-pkg"},
+            {"platform":"windows-amd64","os":"windows","arch":"amd64","runner":"windows-2025","artifact":"supervizio-windows-amd64","pkg_artifact":"supervizio-windows-choco"}
+          ]'
+          # The plain images, as e2e.yml's illumos and Solaris legs boot them:
+          # nothing is compiled here, so no gcc variant is needed.
+          solarish='[
+            {"platform":"illumos-amd64","goos":"illumos","os":"omnios","release":"r151054","artifact":"supervizio-illumos-amd64","tests_artifact":"solarish-tests-illumos-amd64","pkg_artifact":"supervizio-illumos-amd64-pkg"},
+            {"platform":"solaris-amd64","goos":"solaris","os":"solaris","release":"11.4","artifact":"supervizio-solaris-amd64","tests_artifact":"solarish-tests-solaris-amd64","pkg_artifact":"supervizio-solaris-amd64-pkg"}
+          ]'
+          known="$(jq -rn --argjson a "$bsd" --argjson b "$desktop" --argjson c "$solarish" '($a + $b + $c | map(.platform)) + ["windows-arm64"] | .[]')"
+          if [ -n "${ONLY// /}" ]; then
+            want="$(printf '%s' "$ONLY" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u)"
+          else
+            want="$known"
+          fi
+          # An `only` naming something this workflow does not build is a typo,
+          # and a typo that builds zero packages is how a release ships
+          # without one. Refused, with the list.
+          unknown="$(comm -23 <(printf '%s\n' "$want" | sort) <(printf '%s\n' "$known" | sort))"
+          [ -z "$unknown" ] || { echo "::error::only names platforms this workflow does not build: $(printf '%s\n' "$unknown" | paste -sd' ' -)"; printf '%s\n' "$known"; exit 1; }
+          wantj="$(printf '%s\n' "$want" | jq -R . | jq -sc .)"
+          sel_bsd="$(jq -c --argjson w "$wantj" '[.[] | select(.platform as $p | $w | index($p))]' <<<"$bsd")"
+          sel_desktop="$(jq -c --argjson w "$wantj" '[.[] | select(.platform as $p | $w | index($p))]' <<<"$desktop")"
+          sel_solarish="$(jq -c --argjson w "$wantj" '[.[] | select(.platform as $p | $w | index($p))]' <<<"$solarish")"
+          warm="$(jq -r --argjson w "$wantj" '$w | index("windows-arm64") != null' <<<'null')"
+          {
+            echo "bsd=$sel_bsd"
+            echo "desktop=$sel_desktop"
+            echo "solarish=$sel_solarish"
+            echo "windows_arm64=$warm"
+          } >> "$GITHUB_OUTPUT"
+          echo "request $REQUEST_ID: agent@$SOURCE_SHA, run $SOURCE_RUN_ID, version $VERSION_NUM"
+          printf 'packages: %s\n' "$(printf '%s\n' "$want" | paste -sd' ' -)"
+
+  # ---------------------------------------------------------------------------
+  # FreeBSD, NetBSD and both OpenBSD arches, each in a vmactions guest. The
+  # guest script is agent's own: it proves the binary starts, stages the tree
+  # where build-pkg.sh reads it, packages, checks the packing list, installs
+  # the package through setup/install.sh and uninstalls it.
+  # ---------------------------------------------------------------------------
+  bsd:
+    name: ${{ matrix.platform }} package
+    needs: [admit]
+    if: ${{ needs.admit.outputs.bsd != '[]' }}
+    runs-on: ubuntu-26.04
+    environment: private-source
+    # 60: the openbsd-arm64 guest is TCG-emulated. It packages and installs,
+    # compiles nothing, and lands far below this; a cap that cancels would
+    # read as a packaging failure and name the wrong cause.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.admit.outputs.bsd) }}
+    env:
+      SOURCE_SHA: ${{ needs.admit.outputs.sha }}
+      SOURCE_RUN_ID: ${{ needs.admit.outputs.run_id }}
+      VERSION_NUM: ${{ needs.admit.outputs.version_num }}
+    steps:
+      # A kodflow-ci App token for supervizio/agent alone, minted here because
+      # this job runs in the private-source environment (the only place the
+      # App's key can be read), revoked when the job ends.
+      - name: Token for supervizio/agent (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: supervizio
+          repositories: agent
+          permission-contents: read
+          permission-actions: read
+
+      - name: Sparse checkout of agent's packaging tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: supervizio/agent
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ steps.app.outputs.token }}
+          # The workspace is synced wholesale into the guest: a persisted
+          # credential would travel with it.
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /setup/
+            /examples/config.yaml
+            /.github/scripts/bsd-package-in-guest.sh
+
+      - name: Download the cross-built binary from the agent run
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin
+          repository: supervizio/agent
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Check the binary arrived
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          BIN="bin/$ARTIFACT"
+          [ -f "$BIN" ] || BIN="$(find bin -type f | head -1)"
+          [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no binary in $ARTIFACT" >&2; exit 1; }
+          chmod +x "$BIN"
+          mv "$BIN" supervizio-target
+          rm -rf bin
+          file supervizio-target
+          ls -l supervizio-target
+
+      # Three steps, not one: `uses:` takes no expression. The script they run
+      # is one file, so the duplication stops at the action reference.
+      - name: Package it inside a real FreeBSD
+        if: matrix.os == 'freebsd'
+        # 15.1: the release runner-template's FreeBSD legs boot, and the one
+        # agent packaged on before this moved (agent#277; 15.0 reached
+        # end-of-life on 2026-09-30). `pkg create` stamps FreeBSD:15:amd64 on
+        # any 15.x. An action's default release is not a contract: pinned.
+        uses: vmactions/freebsd-vm@a2f9a41fa97f6848b8c3b791087dfcdaa5b473ff # v1.5.8
+        env:
+          SVZ_VERSION_NUM: ${{ env.VERSION_NUM }}
+          SVZ_OS: freebsd
+        with:
+          release: "15.1"
+          usesh: true
+          copyback: true
+          # ssh forwards no environment: what the script reads is named here.
+          envs: SVZ_VERSION_NUM SVZ_OS
+          run: sh .github/scripts/bsd-package-in-guest.sh
+
+      - name: Package it inside a real NetBSD
+        if: matrix.os == 'netbsd'
+        uses: vmactions/netbsd-vm@20ee93a005c9fc78743e6e05269f4cb023b87413 # v1.5.0
+        env:
+          SVZ_VERSION_NUM: ${{ env.VERSION_NUM }}
+          SVZ_OS: netbsd
+        with:
+          release: "10.1"
+          usesh: true
+          copyback: true
+          envs: SVZ_VERSION_NUM SVZ_OS
+          run: sh .github/scripts/bsd-package-in-guest.sh
+
+      # One step for both OpenBSD arches: `with:` takes an expression.
+      - name: Package it inside a real OpenBSD (${{ matrix.vm_arch }})
+        if: matrix.os == 'openbsd'
+        uses: vmactions/openbsd-vm@86cdc08415d9d0865267e686561e276c52d62530 # v1.4.7
+        env:
+          SVZ_VERSION_NUM: ${{ env.VERSION_NUM }}
+          SVZ_OS: openbsd
+        with:
+          # 7.8, the sysroot both binaries are cross-linked against. Not the
+          # floor of what the package claims: e2e.yml installs this package on
+          # 7.3 through 7.9, both arches, and that is what proves it.
+          release: "7.8"
+          arch: ${{ matrix.vm_arch }}
+          usesh: true
+          copyback: true
+          envs: SVZ_VERSION_NUM SVZ_OS
+          # jq, because the script runs setup/install.sh.
+          prepare: pkg_add -I jq
+          run: sh .github/scripts/bsd-package-in-guest.sh
+
+      - name: Upload the package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.pkg_artifact }}
+          path: artifacts/pkg/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # illumos and Oracle Solaris 11.4: the IPS archive, from the binary agent
+  # cross-compiled with cgo on its own runner against its private sysroot
+  # (agent .github/solarish-cross/). Nothing is compiled here. The guest
+  # script is agent's own: it runs the binary and agent's cross-built Go test
+  # binaries on the kernel, builds the .p5p with build-pkg.sh, installs it,
+  # checks SMF runs it and uninstalls it. Its detailed output stays in the
+  # guest (/var/tmp): only the `=== ` stage lines and the verdict reach this
+  # log, and only the archive is uploaded.
+  # ---------------------------------------------------------------------------
+  solarish:
+    name: ${{ matrix.platform }} package
+    needs: [admit]
+    if: ${{ needs.admit.outputs.solarish != '[]' }}
+    runs-on: ubuntu-26.04
+    environment: private-source
+    # Boot, the tests, packaging, one SMF cycle: about 10 minutes, measured
+    # on the native lane this replaces with a compile on top.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.admit.outputs.solarish) }}
+    env:
+      SOURCE_SHA: ${{ needs.admit.outputs.sha }}
+      SOURCE_RUN_ID: ${{ needs.admit.outputs.run_id }}
+      VERSION_NUM: ${{ needs.admit.outputs.version_num }}
+    steps:
+      # A kodflow-ci App token for supervizio/agent alone, minted here because
+      # this job runs in the private-source environment (the only place the
+      # App's key can be read), revoked when the job ends.
+      - name: Token for supervizio/agent (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: supervizio
+          repositories: agent
+          permission-contents: read
+          permission-actions: read
+
+      - name: Sparse checkout of agent's packaging tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: supervizio/agent
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ steps.app.outputs.token }}
+          # The workspace is synced wholesale into the guest.
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          # LICENSE: the package ships it (build-pkg.sh's license action).
+          sparse-checkout: |
+            /setup/
+            /examples/config.yaml
+            /LICENSE
+            /.github/scripts/solarish-package-in-guest.sh
+
+      - name: Download the cross-built binary from the agent run
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin
+          repository: supervizio/agent
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Download the cross-built Go test binaries from the agent run
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ matrix.tests_artifact }}
+          path: tests
+          repository: supervizio/agent
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      # Binaries only: an ELF that is not x86-64 for this kernel's loader, or
+      # anything else in the downloads, is refused before a guest boots.
+      - name: Check what arrived is binaries, for this kernel
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          BIN="bin/$ARTIFACT"
+          [ -f "$BIN" ] || { echo "::error::no $ARTIFACT in the agent run" >&2; exit 1; }
+          mv "$BIN" supervizio-target
+          rm -rf bin
+          chmod +x supervizio-target
+          file supervizio-target | grep -q 'ELF 64-bit LSB executable, x86-64' || { file supervizio-target; echo "::error::$ARTIFACT is not an x86-64 ELF executable" >&2; exit 1; }
+          n=0
+          for t in tests/*; do
+            [ -f "$t" ] || continue
+            case "$t" in *.test) ;; *) echo "::error::unexpected file in the test binaries: $t" >&2; exit 1 ;; esac
+            file "$t" | grep -q 'ELF 64-bit LSB executable, x86-64' || { echo "::error::$t is not an x86-64 ELF executable" >&2; exit 1; }
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no Go test binary in the agent run" >&2; exit 1; }
+          ls -l supervizio-target
+          echo "$n Go test binaries"
+
+      # `uses:` takes no expression: one step per kernel, one script.
+      - name: Test, package, install under SMF inside OmniOS ${{ matrix.release }}
+        if: matrix.os == 'omnios'
+        uses: vmactions/omnios-vm@9576f0b6d15e7696548409baa533bc0a339caf42 # v1.3.7
+        env:
+          SVZ_GOOS: ${{ matrix.goos }}
+          SVZ_PLATFORM: ${{ matrix.platform }}
+          SVZ_VERSION: ${{ env.VERSION_NUM }}
+        with:
+          release: ${{ matrix.release }}
+          copyback: true
+          # ssh forwards no environment: what the script reads is named here.
+          envs: SVZ_GOOS SVZ_PLATFORM SVZ_VERSION
+          run: sh .github/scripts/solarish-package-in-guest.sh
+
+      - name: Test, package, install under SMF inside Oracle Solaris ${{ matrix.release }}
+        if: matrix.os == 'solaris'
+        uses: vmactions/solaris-vm@87d3c436511cef802cd1637f86f73b1a97715c8c # v1.4.1
+        env:
+          SVZ_GOOS: ${{ matrix.goos }}
+          SVZ_PLATFORM: ${{ matrix.platform }}
+          SVZ_VERSION: ${{ env.VERSION_NUM }}
+        with:
+          release: ${{ matrix.release }}
+          copyback: true
+          envs: SVZ_GOOS SVZ_PLATFORM SVZ_VERSION
+          run: sh .github/scripts/solarish-package-in-guest.sh
+
+      # The guest exits 0 so its package comes back even from a red run; the
+      # verdict is taken here. A missing file is a failure.
+      - name: Verdict
+        env:
+          GOOS_NAME: ${{ matrix.goos }}
+        run: |
+          set -euo pipefail
+          test -f artifacts/status || { echo "::error::the guest wrote no verdict"; exit 1; }
+          [ "$(cat artifacts/status)" = 0 ] || { echo "::error::a guest stage failed (the FAILED line above names it)"; exit 1; }
+          [ -s "artifacts/pkg/supervizio-$GOOS_NAME-amd64.p5p" ] || { echo "::error::no supervizio-$GOOS_NAME-amd64.p5p"; exit 1; }
+          ls -l artifacts/pkg
+
+      - name: Upload the package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.pkg_artifact }}
+          path: artifacts/pkg/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS .pkg (both arches) and the choco .nupkg with its SCM install cycle.
+  # No guest: GitHub hosts these systems directly. No signing and no
+  # notarisation exist today, so no secret beyond the read token is involved.
+  # ---------------------------------------------------------------------------
+  desktop:
+    name: ${{ matrix.platform }} package
+    needs: [admit]
+    if: ${{ needs.admit.outputs.desktop != '[]' }}
+    runs-on: ${{ matrix.runner }}
+    environment: private-source
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.admit.outputs.desktop) }}
+    env:
+      SOURCE_SHA: ${{ needs.admit.outputs.sha }}
+      SOURCE_RUN_ID: ${{ needs.admit.outputs.run_id }}
+      VERSION_NUM: ${{ needs.admit.outputs.version_num }}
+    steps:
+      # A kodflow-ci App token for supervizio/agent alone, minted here because
+      # this job runs in the private-source environment (the only place the
+      # App's key can be read), revoked when the job ends.
+      - name: Token for supervizio/agent (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: supervizio
+          repositories: agent
+          permission-contents: read
+          permission-actions: read
+
+      - name: Sparse checkout of agent's packaging tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: supervizio/agent
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /setup/
+            /examples/config.yaml
+            /e2e/test-install.ps1
+
+      - name: Download the cross-built binary from the agent run
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin
+          repository: supervizio/agent
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Package, and prove the package installs (macOS)
+        if: matrix.os == 'macos'
+        env:
+          SVZ_ARCH: ${{ matrix.arch }}
+          SVZ_ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          BIN="$(find bin -type f | head -1)"
+          [ -n "$BIN" ] || { echo "::error::no binary in the downloaded artifact" >&2; exit 1; }
+          chmod +x "$BIN"
+
+          # An arm64 runner runs an amd64 binary under Rosetta and an Intel
+          # one cannot run arm64 at all, so assert the FILE, which is true
+          # either way and is what ships.
+          file "$BIN"
+          case "$SVZ_ARCH" in
+            amd64) file "$BIN" | grep -q 'x86_64' || { echo "::error::$SVZ_ARTIFACT is not x86_64" >&2; exit 1; } ;;
+            arm64) file "$BIN" | grep -q 'arm64'  || { echo "::error::$SVZ_ARTIFACT is not arm64" >&2; exit 1; } ;;
+          esac
+
+          # build-pkg.sh reads the launchd plist and the example config from
+          # hardcoded /tmp paths, both guarded: without this the .pkg builds
+          # and ships with no launchd job.
+          rm -rf /tmp/setup /tmp/examples
+          cp -R setup /tmp/setup
+          mkdir -p /tmp/examples && cp examples/config.yaml /tmp/examples/config.yaml
+          [ -f /tmp/setup/init/launchd/io.superviz.agent.plist ] || {
+            echo "::error::/tmp/setup/init/launchd/io.superviz.agent.plist missing - the .pkg would ship with no launchd job" >&2
+            exit 1
+          }
+
+          sh setup/packaging/macos/build-pkg.sh "$VERSION_NUM" "$BIN" "$SVZ_ARCH"
+          mkdir -p artifacts/pkg
+          found=0
+          for f in /tmp/supervizio-*.pkg; do
+            [ -f "$f" ] || continue
+            cp "$f" artifacts/pkg/; found=1
+          done
+          [ "$found" = 1 ] || { echo "::error::build-pkg.sh produced no .pkg" >&2; exit 1; }
+          ls -l artifacts/pkg
+
+      - name: choco pack, then the full SCM install cycle (Windows amd64)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Get-ChildItem -Path bin -File -Recurse | Select-Object -First 1
+          if (-not $bin) { throw "no binary in the downloaded artifact" }
+          & $bin.FullName --version
+
+          # The nuspec packs tools/, and the package needs all three: the
+          # binary, the service installer it runs at install time, and the
+          # example config. The binary alone installs an executable and never
+          # registers a service.
+          $tools = 'setup/packaging/windows/choco/tools'
+          Copy-Item -Force $bin.FullName (Join-Path $tools 'supervizio.exe')
+          Copy-Item -Force 'setup/init/windows/install-service.ps1' (Join-Path $tools 'install-service.ps1')
+          Copy-Item -Force 'examples/config.yaml' (Join-Path $tools 'config.example.yaml')
+
+          New-Item -ItemType Directory -Force -Path artifacts/pkg | Out-Null
+          $out = (Resolve-Path artifacts/pkg).Path
+          Push-Location setup/packaging/windows/choco
+          choco pack supervizio.nuspec --version $env:VERSION_NUM --outputdirectory $out
+          if ($LASTEXITCODE -ne 0) { throw "choco pack failed with $LASTEXITCODE" }
+          Pop-Location
+          if (-not (Get-ChildItem -Path $out -Filter '*.nupkg')) { throw "choco pack produced no .nupkg" }
+          Get-ChildItem $out
+
+          # install -> service starts -> child restart-on-kill -> stop ->
+          # uninstall. -PackageDir is required.
+          ./e2e/test-install.ps1 -PackageDir $out
+
+      # A service has no console: why it failed is in the event logs.
+      - name: Service diagnostics on failure
+        if: failure() && matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'supervizio' } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, Id, Message
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'supervizio|Supervizio' } | Format-List TimeCreated, Id, Message
+          Get-ChildItem -Recurse 'C:\ProgramData\supervizio' -ErrorAction SilentlyContinue |
+            Where-Object { -not $_.PSIsContainer } |
+            ForEach-Object { Write-Host "--- $($_.FullName)"; Get-Content $_.FullName -Tail 50 }
+
+      - name: Upload the package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.pkg_artifact }}
+          path: artifacts/pkg/
+          retention-days: 1
+          if-no-files-found: error
+
+  # The arm64 twin of the Windows entry, through the INSTALL route an arm64
+  # user takes: the choco package is amd64-only, so this stages the .zip
+  # layout agent's packages-windows-zip builds and drives test-install.ps1
+  # down its -ZipPath branch. It uploads nothing and is advisory
+  # (continue-on-error): windows-11-arm has no track record here yet, so it
+  # shows on the run without failing it.
+  windows-arm64:
+    name: windows-arm64 zip + SCM cycle (advisory)
+    needs: [admit]
+    if: ${{ needs.admit.outputs.windows_arm64 == 'true' }}
+    runs-on: windows-11-arm
+    environment: private-source
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      SOURCE_SHA: ${{ needs.admit.outputs.sha }}
+      SOURCE_RUN_ID: ${{ needs.admit.outputs.run_id }}
+      VERSION_NUM: ${{ needs.admit.outputs.version_num }}
+    steps:
+      # A kodflow-ci App token for supervizio/agent alone, minted here because
+      # this job runs in the private-source environment (the only place the
+      # App's key can be read), revoked when the job ends.
+      - name: Token for supervizio/agent (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: supervizio
+          repositories: agent
+          permission-contents: read
+          permission-actions: read
+
+      - name: Sparse checkout of agent's packaging tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: supervizio/agent
+          ref: ${{ env.SOURCE_SHA }}
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /setup/init/windows/
+            /e2e/test-install.ps1
+
+      - name: Download the cross-built binary from the agent run
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: supervizio-windows-arm64
+          path: bin
+          repository: supervizio/agent
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Stage the zip, then the full SCM install cycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Get-ChildItem -Path bin -File -Recurse | Select-Object -First 1
+          if (-not $bin) { throw "no binary in the downloaded artifact" }
+
+          # The runner emulates x64, so --version alone would pass an amd64
+          # binary uploaded under the arm64 name. Read the PE machine field:
+          # 0xAA64 is ARM64.
+          $bytes = [System.IO.File]::ReadAllBytes($bin.FullName)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          if ($machine -ne 0xAA64) { throw ("{0} is not ARM64 (PE machine 0x{1:X4})" -f $bin.Name, $machine) }
+          & $bin.FullName --version
+
+          $stage = Join-Path $env:RUNNER_TEMP 'zip-src/supervizio'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item -Force $bin.FullName (Join-Path $stage 'supervizio.exe')
+          Copy-Item -Force 'setup/init/windows/install-service.ps1' (Join-Path $stage 'install-service.ps1')
+          $zip = Join-Path $env:RUNNER_TEMP 'supervizio-windows-arm64.zip'
+          Compress-Archive -Force -Path $stage -DestinationPath $zip
+          ./e2e/test-install.ps1 -ZipPath $zip
+
+      - name: Service diagnostics on failure
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'supervizio' } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Format-List TimeCreated, Id, Message
+          Get-WinEvent -FilterHashtable @{ LogName = 'System'; ProviderName = 'Service Control Manager' } -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'supervizio|Supervizio' } | Format-List TimeCreated, Id, Message

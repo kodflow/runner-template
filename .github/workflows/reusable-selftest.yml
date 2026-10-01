@@ -1,0 +1,101 @@
+# selftest — prove an owner's runner-template is wired, end to end, without
+# touching anything private.
+#
+# A REUSABLE workflow, called by every owner's runner-template stub
+# `selftest.yml` on repository_dispatch `runner-template-selftest`. It walks
+# the path every real lane takes, minus the private read:
+#   * `admit` checks the payload with no credential;
+#   * `probe` runs in the CALLER's `private-source` environment (main only),
+#     reads the caller's `vars.CI_APP_CLIENT_ID` and the environment's
+#     `secrets.CI_APP_PRIVATE_KEY`, mints a kodflow-ci App token for the
+#     caller's own runner-template repository with `metadata: read` only, and
+#     uses it once;
+#   * it uploads a one-line artifact the dispatcher downloads, then the
+#     dispatcher deletes the run, as a private caller would.
+# A green run therefore says: the stub calls this repository at its pin, the
+# environment resolves in the caller, the App key and client id are there,
+# the App is installed on the owner, and artifacts come back.
+name: selftest
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit of kodflow/runner-template the stub pins (the same SHA as its `uses:`)
+        required: true
+        type: string
+      payload:
+        description: "The dispatch payload as JSON (the stub passes toJSON of it): request_id"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  admit:
+    name: admit
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      request_id: ${{ steps.admit.outputs.request_id }}
+    steps:
+      # Anonymous: this job holds no credential, not even to read a public
+      # repository. scripts/admit.sh at the pinned commit, and nothing else.
+      - name: Fetch admit.sh
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-hex commit of kodflow/runner-template"; exit 1; }
+          git init -q rt
+          git -C rt fetch -q --depth=1 https://github.com/kodflow/runner-template.git "$REF"
+          git -C rt -c advice.detachedHead=false checkout -q FETCH_HEAD
+
+      - name: Admit the dispatch
+        id: admit
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: >-
+          rt/scripts/admit.sh
+          'request_id=[0-9]{1,20}-[0-9]{1,4}-[a-z0-9-]{1,40}'
+
+  probe:
+    name: probe
+    needs: admit
+    runs-on: ubuntu-latest
+    environment: private-source
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      # The caller's own runner-template, metadata only: the least a token
+      # can be scoped to, and enough to prove the App answers for this owner.
+      - name: Token for this runner-template (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: runner-template
+          permission-metadata: read
+
+      - name: Use the token once
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REQUEST_ID: ${{ needs.admit.outputs.request_id }}
+        run: |
+          set -euo pipefail
+          name=$(gh api "repos/${GITHUB_REPOSITORY}" --jq .full_name)
+          [ "$name" = "$GITHUB_REPOSITORY" ] || { echo "::error::the App token did not read ${GITHUB_REPOSITORY}"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/selftest"
+          printf 'ok %s %s\n' "$GITHUB_REPOSITORY" "$REQUEST_ID" > "$RUNNER_TEMP/selftest/result.txt"
+          echo "ok: the kodflow-ci App answers for ${GITHUB_REPOSITORY} from its private-source environment"
+
+      - name: Upload the result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: selftest-result
+          path: ${{ runner.temp }}/selftest/result.txt
+          retention-days: 1
+          if-no-files-found: error

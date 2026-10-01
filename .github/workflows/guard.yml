@@ -32,7 +32,7 @@ jobs:
         run: python3 -m unittest discover -s tests -v
 
       - name: shellcheck
-        run: shellcheck scripts/*.sh
+        run: shellcheck scripts/*.sh scripts/*/*.sh
 
       # The official image, pinned by digest (1.7.12).
       - name: actionlint

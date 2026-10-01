@@ -1,0 +1,199 @@
+# native-tests — run test binaries a private repository compiled elsewhere on
+# real macOS, Windows or Linux kernels of GitHub-hosted runners.
+#
+# A REUSABLE workflow: it runs only when an owner's runner-template stub
+# calls it, so the run, its log and its artifacts live in that public
+# repository and are free. The stub names the private repository and the
+# legs; the private repository's CI cross-compiles `go test -c` binaries on
+# its self-hosted Linux runner, uploads them to its own run, dispatches the
+# stub with a request id, finds the run by its title, waits for it,
+# downloads the reports, prints them in its own private log, and DELETES the
+# public run with its own token. Nothing stays public once it has been
+# brought back. kodflow/ktn-linter's `native` job is the first caller
+# (kodflow's stub ktn-native-tests.yml); this is also the lane for any
+# private repository's end-to-end tests that need a native kernel.
+#
+# What reaches the public run: the test binaries, downloaded from the
+# private run. Never its source. What leaves a job: one ok/FAIL line per
+# binary in this log, and the binaries' output as a report artifact (one day
+# at most, and gone with the run).
+name: native-tests
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit of kodflow/runner-template the stub pins (the same SHA as its `uses:`); the scripts are read there
+        required: true
+        type: string
+      payload:
+        description: "The dispatch payload as JSON (the stub passes toJSON of it): source_repo, request_id, run_id"
+        required: true
+        type: string
+      source_repo:
+        description: The one private repository this stub serves (owner/name), set in the stub, never taken from the payload
+        required: true
+        type: string
+      legs:
+        description: >-
+          JSON array of legs: {leg, runner, artifact, dir, specs}. `artifact`
+          is the private run's artifact holding the binaries, `dir` the
+          directory inside it, `specs` the space-separated
+          `<binary>[:<-test.run regexp>]` list scripts/run-test-binaries.sh
+          takes.
+        required: true
+        type: string
+      report_prefix:
+        description: Each leg's report artifact is `<report_prefix><leg>`, the name the caller downloads
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  # No credential here. Everything the payload says is untrusted text until
+  # this job has checked it. Only a token with write access to the stub's
+  # repository can dispatch, but the check keeps a leaked one from steering
+  # the token below at anything but the stub's own private repository.
+  admit:
+    name: admit
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      run_id: ${{ steps.admit.outputs.run_id }}
+      owner: ${{ steps.split.outputs.owner }}
+      name: ${{ steps.split.outputs.name }}
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      # Anonymous: this job holds no credential, not even to read a public
+      # repository. scripts/admit.sh at the pinned commit, and nothing else.
+      - name: Fetch admit.sh
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-hex commit of kodflow/runner-template"; exit 1; }
+          git init -q rt
+          git -C rt fetch -q --depth=1 https://github.com/kodflow/runner-template.git "$REF"
+          git -C rt -c advice.detachedHead=false checkout -q FETCH_HEAD
+
+      - name: Admit the dispatch
+        id: admit
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+        run: >-
+          rt/scripts/admit.sh
+          --allow "source_repo=$SOURCE_REPO"
+          --run-starts-request
+          'source_repo=[a-z0-9-]{1,39}/[A-Za-z0-9_-]{1,100}'
+          'request_id=[0-9]{1,20}-[0-9]{1,4}-[a-z0-9-]{1,40}'
+          'run_id=[0-9]{1,20}'
+
+      # The stub's inputs are trusted (they live in the repository, under
+      # review), but the token's scope is built from them, so they are held to
+      # a shape anyway: one owner, one repository, nothing an expression could
+      # widen.
+      - name: Split the source repository
+        id: split
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REPO" =~ ^([a-z0-9-]{1,39})/([A-Za-z0-9_-]{1,100})$ ]] || { echo "::error::source_repo must be owner/name"; exit 1; }
+          echo "owner=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          echo "name=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+
+      - name: Check the legs
+        id: legs
+        env:
+          LEGS: ${{ inputs.legs }}
+        run: |
+          set -euo pipefail
+          jq -e '
+            type == "array" and length > 0 and all(.[];
+              (keys | sort) == ["artifact","dir","leg","runner","specs"]
+              and (.leg | test("^[a-z0-9-]{1,40}$"))
+              and (.runner | test("^(macos|windows|ubuntu)-[a-z0-9.-]{1,40}$"))
+              and (.artifact | test("^[A-Za-z0-9_.-]{1,100}$"))
+              and (.dir | test("^[A-Za-z0-9_.-]{1,100}$"))
+              and (.specs | test("^[A-Za-z0-9_.:^$|()\\[\\]*+? -]{1,400}$")))
+          ' <<<"$LEGS" >/dev/null || { echo "::error::legs must be an array of {leg, runner, artifact, dir, specs} on hosted runners"; exit 1; }
+          echo "legs=$(jq -c . <<<"$LEGS")" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: ${{ matrix.leg }}
+    needs: admit
+    runs-on: ${{ matrix.runner }}
+    # The kodflow-ci App's key (secrets.CI_APP_PRIVATE_KEY) lives in the
+    # caller's environment of this name, which deploys from main only. A
+    # called workflow resolves `environment:` in the calling repository.
+    environment: private-source
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.admit.outputs.legs) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # kodflow/runner-template at the pinned commit, for scripts/. A called
+      # workflow checks out the CALLER by default; nothing private is checked
+      # out here.
+      - name: Checkout runner-template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kodflow/runner-template
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # A kodflow-ci App installation token, minted here (the only place the
+      # App's key can be read): one repository, the permissions this job uses,
+      # revoked by the action's post step when the job ends.
+      - name: Token for the source repository (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: ${{ needs.admit.outputs.owner }}
+          repositories: ${{ needs.admit.outputs.name }}
+          permission-actions: read
+
+      - name: Download the test binaries from the private run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ runner.temp }}/bin
+          repository: ${{ inputs.source_repo }}
+          run-id: ${{ needs.admit.outputs.run_id }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      - name: Run the test binaries
+        env:
+          BIN_DIR: ${{ runner.temp }}/bin/${{ matrix.dir }}
+          REPORT_DIR: ${{ runner.temp }}/report
+          SPECS: ${{ matrix.specs }}
+        run: |
+          # runner.temp is a native path (D:\a\_temp on Windows): hand Git
+          # Bash its own form of it rather than rely on MSYS guessing.
+          if command -v cygpath >/dev/null 2>&1; then
+            BIN_DIR=$(cygpath -u "$BIN_DIR")
+            REPORT_DIR=$(cygpath -u "$REPORT_DIR")
+          fi
+          read -r -a specs <<< "$SPECS"
+          scripts/run-test-binaries.sh "$BIN_DIR" "$REPORT_DIR" "${specs[@]}"
+
+      # Uploaded red or green: a failure is exactly when the caller needs it.
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.report_prefix }}${{ matrix.leg }}
+          path: ${{ runner.temp }}/report/
+          retention-days: 1
+          if-no-files-found: ignore

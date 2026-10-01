@@ -1,0 +1,214 @@
+# darwin-build — build a private kodflow repository natively on macOS and
+# hand the binaries back as artifacts of the caller's run.
+#
+# A REUSABLE workflow: it runs only when an owner's runner-template stub
+# calls it (kodflow/runner-template's own stub, .github/workflows/
+# darwin-build.yml in kodflow's runner-template repository, on
+# repository_dispatch `darwin-build`). The run, its log and its artifacts
+# therefore live in the calling repository, and every `vars`, environment
+# and secret below is the caller's. See README.md, "Reusable workflows".
+#
+# kodflow/immobilier and kodflow/ssm-gui build on self-hosted Linux pods,
+# where darwin with CGO needs an osxcross SDK and a .app bundle cannot be
+# made at all. Their `darwin` job dispatches the stub with a commit SHA and a
+# request id, finds the run by its title, waits for it, downloads the
+# artifacts, re-uploads them in its own run and DELETES the public run with
+# its own token. Nothing stays public once it has been brought back.
+#
+# What leaves a job: the binaries (artifacts, one day at most, and gone with
+# the run) and one ok/FAIL line per build step. Never the source, and never a
+# build log — compilers and bundlers quote the source they fail on, and the
+# caller's logs are public (scripts/quiet.sh).
+name: darwin-build
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: The commit of kodflow/runner-template the stub pins (the same SHA as its `uses:`); the scripts are read there
+        required: true
+        type: string
+      payload:
+        description: "The dispatch payload as JSON (the stub passes toJSON of it): source_repo, sha, version, request_id"
+        required: true
+        type: string
+
+permissions: {}
+
+env:
+  # The wails CLI matching the library version in ssm-gui's go.mod.
+  WAILS_VERSION: v2.6.0
+
+jobs:
+  # No credential here: see ktn-native-tests.yml. Each build job then mints a
+  # token for its own repository only, named literally, never from the payload.
+  admit:
+    name: admit
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      repo: ${{ steps.admit.outputs.source_repo }}
+      sha: ${{ steps.admit.outputs.sha }}
+      version: ${{ steps.admit.outputs.version }}
+    steps:
+      # Anonymous: this job holds no credential, not even to read a public
+      # repository. scripts/admit.sh at the pinned commit, and nothing else.
+      - name: Fetch admit.sh
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::ref must be a full 40-hex commit of kodflow/runner-template"; exit 1; }
+          git init -q rt
+          git -C rt fetch -q --depth=1 https://github.com/kodflow/runner-template.git "$REF"
+          git -C rt -c advice.detachedHead=false checkout -q FETCH_HEAD
+
+      - name: Admit the dispatch
+        id: admit
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+        run: >-
+          rt/scripts/admit.sh
+          --allow source_repo=kodflow/immobilier,kodflow/ssm-gui
+          'source_repo=[a-z0-9-]{1,39}/[A-Za-z0-9_-]{1,100}'
+          'sha=[0-9a-f]{40}'
+          'version?=[0-9A-Za-z._+-]{0,64}'
+          'request_id=[0-9]{1,20}-[0-9]{1,4}-[a-z0-9-]{1,40}'
+
+  immobilier:
+    name: immobilier (darwin amd64 + arm64)
+    needs: admit
+    if: needs.admit.outputs.repo == 'kodflow/immobilier'
+    runs-on: macos-latest
+    environment: private-source
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # kodflow/runner-template at the pinned commit, for scripts/. A called
+      # workflow checks out the CALLER by default; nothing private is checked
+      # out here.
+      - name: Checkout runner-template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kodflow/runner-template
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # A kodflow-ci App installation token, minted here (the only place the
+      # App's key can be read): one repository, the permissions this job uses,
+      # revoked by the action's post step when the job ends.
+      - name: Token for kodflow/immobilier (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: kodflow
+          repositories: immobilier
+          permission-contents: read
+
+      - name: Fetch the private source
+        env:
+          SOURCE_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: kodflow/immobilier
+          SHA: ${{ needs.admit.outputs.sha }}
+        run: scripts/fetch-source.sh "$REPO" "$SHA" "$RUNNER_TEMP/src"
+
+      # cache: false everywhere. A cache written by a main-branch run here is
+      # readable by any pull_request run of this public repository, and the Go
+      # build cache holds the private code compiled.
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ runner.temp }}/src/go.mod
+          cache: false
+
+      - name: Build
+        env:
+          VERSION: ${{ needs.admit.outputs.version }}
+        run: scripts/build-immobilier.sh "$RUNNER_TEMP/src" "$VERSION" "$RUNNER_TEMP/out"
+
+      # The artifact names the private release job merges (binaries-*).
+      - name: Upload darwin/amd64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-darwin-amd64
+          path: ${{ runner.temp }}/out/immobilier_darwin_amd64.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload darwin/arm64
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-darwin-arm64
+          path: ${{ runner.temp }}/out/immobilier_darwin_arm64.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  ssm-gui:
+    name: ssm-gui (darwin universal .app)
+    needs: admit
+    if: needs.admit.outputs.repo == 'kodflow/ssm-gui'
+    runs-on: macos-latest
+    environment: private-source
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      # kodflow/runner-template at the pinned commit, for scripts/. A called
+      # workflow checks out the CALLER by default; nothing private is checked
+      # out here.
+      - name: Checkout runner-template
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: kodflow/runner-template
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      # A kodflow-ci App installation token, minted here (the only place the
+      # App's key can be read): one repository, the permissions this job uses,
+      # revoked by the action's post step when the job ends.
+      - name: Token for kodflow/ssm-gui (kodflow-ci App)
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
+          owner: kodflow
+          repositories: ssm-gui
+          permission-contents: read
+
+      - name: Fetch the private source
+        env:
+          SOURCE_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: kodflow/ssm-gui
+          SHA: ${{ needs.admit.outputs.sha }}
+        run: scripts/fetch-source.sh "$REPO" "$SHA" "$RUNNER_TEMP/src"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          # wails v2.6.0 embeds golang.org/x/tools v0.6.0, which panics under
+          # recent Go toolchains; Go 1.21 matches its era (as in ssm-gui).
+          go-version: "1.21"
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: "20"
+          package-manager-cache: false
+
+      - name: Build
+        run: scripts/build-ssm-gui.sh "$RUNNER_TEMP/src" "$RUNNER_TEMP/out"
+
+      # The artifact name ssm-gui's own workflow publishes for darwin.
+      - name: Upload the .app
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wails-build-darwin
+          path: ${{ runner.temp }}/out/ssm-gui-darwin-universal.app.zip
+          retention-days: 1
+          if-no-files-found: error
