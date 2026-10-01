@@ -1,10 +1,10 @@
 # =============================================================================
 # THE ONE PRODUCER OF agent's BSD, macOS AND CHOCOLATEY PACKAGES.
 #
-# agent is private and pays for every hosted minute; this repository is public
-# and does not. agent cross-compiles every one of these binaries on its own
-# self-hosted runner; what needs a real system is the PACKAGING TOOL, so that
-# is all that runs here:
+# agent is private and pays for every hosted minute; supervizio/runner-template,
+# whose stub runs this, is public and does not. agent cross-compiles every one
+# of these binaries on its own self-hosted runner; what needs a real system is
+# the PACKAGING TOOL, so that is all that runs here:
 #
 #   freebsd-amd64   `pkg create` in a FreeBSD 15.1 guest
 #   netbsd-amd64    `pkg_create` in a NetBSD 10.1 guest
@@ -58,7 +58,7 @@
 #   packaged, and a copy here would drift from the build-pkg.sh it wraps.
 #
 # SECURITY MODEL (a public workflow holding a credential to a private repo):
-#   * repository_dispatch and workflow_dispatch only. Never pull_request or
+#   * called by a stub on repository_dispatch only. Never pull_request or
 #     pull_request_target: a fork's code can never run next to the token.
 #   * No personal token. The jobs that read agent run in the `private-source`
 #     ENVIRONMENT (deployment branches: `main` only), the only place the

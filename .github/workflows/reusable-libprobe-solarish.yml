@@ -25,7 +25,7 @@
 #
 # SECURITY MODEL (a public workflow holding a credential to a private repo),
 # the same as agent-packages.yml's:
-#   * repository_dispatch and workflow_dispatch only. Never pull_request or
+#   * called by a stub on repository_dispatch only. Never pull_request or
 #     pull_request_target: a fork's code never runs next to the token.
 #   * No personal token. The guest job runs in the `private-source`
 #     environment (deployment branches: main), the only place the kodflow-ci
