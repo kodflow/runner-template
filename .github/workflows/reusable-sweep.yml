@@ -1,0 +1,74 @@
+# sweep — delete dispatched runs their caller never took back.
+#
+# A REUSABLE workflow, called on a schedule by each owner's runner-template
+# stub (`sweep.yml` there), which names the workflows to sweep. It works on
+# the CALLING repository with that repository's GITHUB_TOKEN (the stub grants
+# `actions: write`, nothing else).
+#
+# The caller deletes its run as soon as it has downloaded the results. That
+# fails when the caller dies first: a cancelled job, a runner pod that went
+# away, a deadline hit while the public run was still queued. Such a run
+# would name a private SHA and keep its artifacts for their day. This sweep
+# deletes every repository_dispatch run of the named workflows older than the
+# callers' longest life:
+#   * completed, and last updated more than two hours ago;
+#   * still queued or in progress three hours after it was created (a caller
+#     gives up after 75 minutes): cancelled, then deleted once completed.
+#
+# Not a workflow_run janitor: deleting a run the moment it completes would
+# race the caller's download. A workflow_dispatch run is someone debugging on
+# purpose and is left alone, and so is every workflow the stub does not name
+# (supervizio's validate-release runs are release evidence and must stay).
+# This run checks out nothing and prints only run ids.
+name: sweep
+
+on:
+  workflow_call:
+    inputs:
+      workflows:
+        description: Space-separated workflow file names of the calling repository whose repository_dispatch runs are swept
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  sweep:
+    name: sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      # Delete-only: nothing is checked out.
+      actions: write
+    steps:
+      - name: Delete stale dispatched runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOWS: ${{ inputs.workflows }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOWS" =~ ^[A-Za-z0-9_.\ -]{1,400}$ ]] || { echo "::error::workflows must be space-separated file names"; exit 1; }
+          done_cutoff=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)
+          live_cutoff=$(date -u -d '-3 hours' +%Y-%m-%dT%H:%M:%SZ)
+          list() { # workflow status cutoff-field cutoff: every page first, then act
+            gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/$1/runs?event=repository_dispatch&status=$2&per_page=100" \
+              -q ".workflow_runs[] | select(.$3 < \"$4\") | .id"
+          }
+          read -r -a wfs <<< "$WORKFLOWS"
+          for wf in "${wfs[@]}"; do
+            [[ "$wf" =~ ^[A-Za-z0-9_.-]+\.ya?ml$ ]] || { echo "::error::'$wf' is not a workflow file name"; exit 1; }
+            # Collected in full before anything is deleted: deleting while
+            # paging shifts the pages and skips runs.
+            stale=$(list "$wf" completed updated_at "$done_cutoff")
+            live=$( { list "$wf" queued created_at "$live_cutoff"; list "$wf" in_progress created_at "$live_cutoff"; } )
+            while IFS= read -r rid; do
+              [ -n "$rid" ] || continue
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}/cancel" >/dev/null || true
+              echo "cancelled ${wf} run ${rid} (abandoned); the next sweep deletes it"
+            done <<< "$live"
+            while IFS= read -r rid; do
+              [ -n "$rid" ] || continue
+              gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${rid}"
+              echo "deleted ${wf} run ${rid}"
+            done <<< "$stale"
+          done

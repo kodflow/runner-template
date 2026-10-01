@@ -8,6 +8,7 @@ Run: python3 -m unittest discover -s tests
 """
 
 import base64
+import json
 import os
 import shutil
 import stat
@@ -177,6 +178,84 @@ class FetchSource(unittest.TestCase):
             )
             self.assertNotEqual(r.returncode, 0)
             self.assertEqual(os.listdir(tmp), [])
+
+
+class Admit(unittest.TestCase):
+    """scripts/admit.sh decides what of a dispatch payload reaches the jobs
+    holding a token. These pin what it lets through and what it refuses."""
+
+    SPECS = (
+        "--run-starts-request",
+        "request_id=[0-9]{1,20}-[0-9]{1,4}-[a-z]{1,20}",
+        "sha=[0-9a-f]{40}",
+        "run_id=[0-9]{1,20}",
+        "only?=[a-z0-9 -]{0,40}",
+    )
+    GOOD = {"request_id": "123-1-openbsd", "sha": "a" * 40, "run_id": "123"}
+
+    def admit(self, payload, *specs):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out")
+            text = payload if isinstance(payload, str) else json.dumps(payload)
+            r = run("admit.sh", *(specs or self.SPECS), env={"PAYLOAD": text, "GITHUB_OUTPUT": out})
+            outputs = {}
+            if os.path.exists(out):
+                with open(out, encoding="utf-8") as fh:
+                    outputs = dict(line.split("=", 1) for line in fh.read().splitlines())
+            return r, outputs
+
+    def test_admits_a_good_payload(self):
+        r, out = self.admit(dict(self.GOOD, ignored="anything\nat all"))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(out, dict(self.GOOD, only=""))
+        self.assertNotIn("ignored", r.stdout)
+
+    def test_numbers_are_values(self):
+        r, out = self.admit(dict(self.GOOD, run_id=123))
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(out["run_id"], "123")
+
+    def test_refusals(self):
+        cases = {
+            "missing field": {k: v for k, v in self.GOOD.items() if k != "sha"},
+            "short sha": dict(self.GOOD, sha="abc"),
+            "newline smuggles an output": dict(self.GOOD, only="x\nsha=" + "b" * 40),
+            "trailing newline": dict(self.GOOD, request_id="123-1-openbsd\n"),
+            "carriage return": dict(self.GOOD, only="x\ry"),
+            "object for a value": dict(self.GOOD, sha={"a": 1}),
+            "array for a value": dict(self.GOOD, only=["x"]),
+            "request names another run": dict(self.GOOD, request_id="124-1-openbsd"),
+            "shell metacharacters": dict(self.GOOD, only="$(id)"),
+        }
+        for name, payload in cases.items():
+            with self.subTest(name):
+                r, out = self.admit(payload)
+                self.assertNotEqual(r.returncode, 0, name)
+                self.assertEqual(out, {}, f"{name}: nothing may be written when a check fails")
+
+    def test_not_an_object(self):
+        for payload in ("", "null", "[]", '"x"', "{not json"):
+            with self.subTest(payload):
+                r, out = self.admit(payload)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(out, {})
+
+    def test_allowlist(self):
+        specs = ("--allow", "source_repo=kodflow/a,kodflow/b", "source_repo=[a-z]+/[a-z]+")
+        r, out = self.admit({"source_repo": "kodflow/b"}, *specs)
+        self.assertEqual(r.returncode, 0, r.stdout)
+        self.assertEqual(out, {"source_repo": "kodflow/b"})
+        for bad in ("kodflow/c", "kodflow/a,kodflow/b", "kodflow"):
+            with self.subTest(bad):
+                r, out = self.admit({"source_repo": bad}, *specs)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertEqual(out, {})
+
+    def test_regex_is_anchored(self):
+        r, _ = self.admit({"sha": "a" * 40 + "z"}, "sha=[0-9a-f]{40}")
+        self.assertNotEqual(r.returncode, 0)
+        r, _ = self.admit({"sha": "z" + "a" * 40}, "sha=[0-9a-f]{40}")
+        self.assertNotEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":

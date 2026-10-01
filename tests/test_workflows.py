@@ -17,7 +17,16 @@ SCRIPTS = os.path.join(ROOT, "scripts")
 # on purpose: see its header).
 GATE = "post-commit.yml"
 APP_TOKEN_PIN = "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1"
-PRIVATE_REPOS = ("ktn-linter", "immobilier", "ssm-gui")
+# Each token names its repository literally, or takes it from the stub (an
+# input the stub sets, split by a credential-free admit job), or is the
+# caller's own runner-template (selftest).
+PRIVATE_REPOS = (
+    "ktn-linter", "immobilier", "ssm-gui", "agent", "libprobe", "runner-template",
+    "${{ needs.admit.outputs.name }}",
+)
+OWNERS = ("kodflow", "supervizio", "${{ needs.admit.outputs.owner }}", "${{ github.repository_owner }}")
+# The logic every owner's runner-template stub calls: `on: workflow_call` only.
+REUSABLE_PREFIX = "reusable-"
 RETIRED = ("PRIVATE_SOURCE_TOKEN", "RUNNER_TEMPLATE_DISPATCH_TOKEN", "NATIVE_CI_SOURCE_TOKEN")
 
 
@@ -65,10 +74,83 @@ class Triggers(unittest.TestCase):
             self.assertNotRegex(code(text), r"(?m)^on:[ \t]*[^\s#]", name)
 
     def test_companions_are_dispatch_only(self):
+        # The pre-centralisation copies also took workflow_dispatch; the stubs
+        # enforce writes in their place take repository_dispatch alone.
         for name in ("ktn-native-tests.yml", "darwin-build.yml"):
             with open(os.path.join(WORKFLOWS, name), encoding="utf-8") as fh:
                 keys = set(re.findall(r"^  ([a-z_]+):", on_block(fh.read()), re.M))
-            self.assertEqual(keys, {"repository_dispatch", "workflow_dispatch"}, name)
+            self.assertIn("repository_dispatch", keys, name)
+            self.assertLessEqual(keys, {"repository_dispatch", "workflow_dispatch"}, name)
+
+    def test_stubs_pass_their_own_pin(self):
+        # A stub here (kodflow's, written by kodflow/post-commit's enforce)
+        # calls this repository at a full SHA and hands the same SHA over as
+        # `ref`, or the called jobs would read scripts of another commit.
+        for name, text in workflows():
+            pins = re.findall(r"uses: kodflow/runner-template/\.github/workflows/reusable-[a-z0-9-]+\.yml@([0-9a-f]{40})$", code(text), re.M)
+            if not pins:
+                continue
+            self.assertEqual(len(pins), 1, name)
+            refs = re.findall(r"^      ref: ([0-9a-f]{40})$", code(text), re.M)
+            self.assertIn(refs, ([], pins), name)
+            self.assertNotRegex(code(text), r"secrets|environment:", name)
+
+
+class Reusable(unittest.TestCase):
+    """The workflows every owner's stub calls. A called workflow runs in the
+    caller: its log, artifacts, environment, vars and secrets are the
+    caller's. What makes that safe is checked here."""
+
+    def reusables(self):
+        found = [(n, t) for n, t in workflows() if n.startswith(REUSABLE_PREFIX)]
+        self.assertGreaterEqual(len(found), 6)
+        return found
+
+    def test_called_only(self):
+        for name, text in self.reusables():
+            keys = set(re.findall(r"^  ([a-z_]+):", on_block(text), re.M))
+            self.assertEqual(keys, {"workflow_call"}, name)
+
+    def test_no_run_name_or_concurrency(self):
+        # Both are ignored in a called workflow (the stub's apply): one here
+        # would only mislead the reader about what names the run.
+        for name, text in self.reusables():
+            self.assertNotRegex(code(text), r"(?m)^(run-name|concurrency):", name)
+
+    def test_lanes_take_the_pin_and_the_payload(self):
+        for name, text in self.reusables():
+            if name == REUSABLE_PREFIX + "sweep.yml":
+                continue
+            inputs = on_block(text)
+            for key in ("ref", "payload"):
+                self.assertRegex(inputs, r"(?m)^      %s:\n" % key, f"{name}: input {key}")
+            # The payload is read through env by scripts/admit.sh, never
+            # pasted into a script by the template engine.
+            self.assertFalse("client_payload" in code(text), name)
+            self.assertEqual(code(text).count("${{ inputs.payload }}"), 1, name)
+
+    def test_admit_holds_nothing(self):
+        for name, text in self.reusables():
+            if name == REUSABLE_PREFIX + "sweep.yml":
+                continue
+            job = jobs(text).get("admit")
+            self.assertIsNotNone(job, f"{name}: no admit job")
+            self.assertRegex(job, r"(?m)^    permissions: \{\}$", name)
+            self.assertNotIn("environment:", job, name)
+            self.assertNotIn("secrets.", job, name)
+            self.assertNotIn("uses: actions/checkout", job, name)
+            self.assertIn("scripts/admit.sh", job, name)
+            self.assertIn("PAYLOAD: ${{ inputs.payload }}", job, name)
+            # Every other job waits for it.
+            for other, body in jobs(text).items():
+                if other != "admit":
+                    self.assertRegex(body, r"(?m)^    needs: \[?admit\]?$", f"{name}:{other}")
+
+    def test_runner_template_is_checked_out_at_the_pin(self):
+        for name, text in self.reusables():
+            for block in re.findall(r"uses: actions/checkout@.*?\n((?:\s{8,}\S.*\n)*)", text):
+                if "repository: kodflow/runner-template" in block:
+                    self.assertIn("ref: ${{ inputs.ref }}", block, name)
 
 
 class AppKeyStaysInTheEnvironment(unittest.TestCase):
@@ -98,10 +180,13 @@ class AppKeyStaysInTheEnvironment(unittest.TestCase):
         for wf, text in workflows():
             for block in re.findall(r"uses: actions/create-github-app-token@.*?\n((?:\s{8,}\S.*\n)+)", text):
                 steps += 1
-                self.assertIn("owner: kodflow", block, wf)
+                owners = re.findall(r"owner: (.+)\n", block)
+                self.assertEqual(len(owners), 1, wf)
+                self.assertIn(owners[0].strip(), OWNERS, wf)
                 self.assertIn("client-id: ${{ vars.CI_APP_CLIENT_ID }}", block, wf)
                 self.assertNotIn("app-id:", block, wf)
-                repos = re.findall(r"repositories: (\S+)\n", block)
+                repos = re.findall(r"repositories: (.+)\n", block)
+                repos = [r.strip() for r in repos]
                 self.assertEqual(len(repos), 1, wf)
                 self.assertIn(repos[0], PRIVATE_REPOS, wf)
                 perms = re.findall(r"permission-([a-z-]+): (\S+)", block)
@@ -141,9 +226,10 @@ class Hygiene(unittest.TestCase):
 
     def test_no_xtrace(self):
         texts = list(workflows())
-        for name in os.listdir(SCRIPTS):
-            with open(os.path.join(SCRIPTS, name), encoding="utf-8") as fh:
-                texts.append((name, fh.read()))
+        for base, _, names in os.walk(SCRIPTS):
+            for name in names:
+                with open(os.path.join(base, name), encoding="utf-8") as fh:
+                    texts.append((name, fh.read()))
         for name, text in texts:
             self.assertNotRegex(code(text), r"set -[a-wyz]*x|set -o xtrace|bash -x", name)
 

@@ -1,0 +1,11 @@
+# Real GitHub-hosted runner labels that actionlint's bundled list doesn't know
+# yet: windows-11-arm (Windows 11 arm64), macos-26/macos-26-intel, and
+# ubuntu-26.04/ubuntu-26.04-arm (GA since 2026-09-17, actions/runner-images
+# #14747; actionlint 1.7.12 still stops at 24.04). Whitelist so lint stays clean.
+self-hosted-runner:
+  labels:
+    - windows-11-arm
+    - macos-26
+    - macos-26-intel
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
