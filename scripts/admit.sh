@@ -82,8 +82,9 @@ for a in ${allows[@]+"${allows[@]}"}; do
 done
 
 if $run_starts_request; then
-  [ -n "${got[request_id]:-}" ] && [ -n "${got[run_id]:-}" ] \
-    || { echo "::error::--run-starts-request needs request_id and run_id"; exit 2; }
+  if [ -z "${got[request_id]:-}" ] || [ -z "${got[run_id]:-}" ]; then
+    echo "::error::--run-starts-request needs request_id and run_id"; exit 2
+  fi
   [ "${got[request_id]%%-*}" = "${got[run_id]}" ] || { echo "::error::request_id does not start with run_id"; exit 1; }
 fi
 
