@@ -56,11 +56,11 @@ class AgentPackagesGuardRails(unittest.TestCase):
             in_env = re.search(r"^    environment: private-source$", job, re.M) is not None
             self.assertEqual(uses_token, in_env, name)
             if uses_token:
-                self.assertIn("persist-credentials: false", job, name)
                 self.assertIn("owner: supervizio\n", job, name)
                 self.assertIn("repositories: agent\n", job, name)
+                # Artifacts only: no checkout of agent, so no contents: read.
                 self.assertEqual(set(re.findall(r"permission-([a-z-]+): (\w+)", job)),
-                                 {("contents", "read"), ("actions", "read")}, name)
+                                 {("actions", "read")}, name)
 
     def test_admit_holds_nothing_and_gates_everything(self):
         admit = self.jobs["admit"]
@@ -79,15 +79,23 @@ class AgentPackagesGuardRails(unittest.TestCase):
             self.assertIn("SOURCE_SHA: ${{ needs.admit.outputs.sha }}", job, name)
             self.assertIn("SOURCE_RUN_ID: ${{ needs.admit.outputs.run_id }}", job, name)
 
-    def test_no_go_source_is_checked_out(self):
-        allowed = {"/setup/", "/setup/init/windows/", "/examples/config.yaml", "/LICENSE",
-                   "/e2e/test-install.ps1", "/.github/scripts/bsd-package-in-guest.sh",
-                   "/.github/scripts/solarish-package-in-guest.sh"}
+    # The one artifact of agent's tree each job reads: the files agent lists
+    # for that group, never a checkout.
+    INPUTS = {"bsd": "bsd", "solarish": "solarish", "desktop": "desktop", "windows-arm64": "desktop"}
+
+    def test_agent_is_never_checked_out(self):
         for name, job in self.jobs.items():
-            for block in re.findall(r"sparse-checkout: \|\n((?:\s{12}\S.*\n)+)", job):
-                self.assertLessEqual({p.strip() for p in block.splitlines()}, allowed, name)
-            checkouts = code(job).count("uses: actions/checkout@")
-            self.assertEqual(checkouts, code(job).count("sparse-checkout-cone-mode: false"), name)
+            self.assertNotIn("uses: actions/checkout@", code(job), name)
+            self.assertNotIn("sparse-checkout", code(job), name)
+
+    def test_each_job_reads_its_packaging_inputs(self):
+        for name, group in self.INPUTS.items():
+            job = self.jobs[name]
+            self.assertEqual(re.findall(r"name: (packaging-inputs-\S+)", job), [f"packaging-inputs-{group}"], name)
+            self.assertIn("tar -xf .packaging-inputs/packaging-inputs.tar -C .", job, name)
+            self.assertIn("rm -rf .packaging-inputs", job, name)
+            for repo in re.findall(r"^\s+repository: (\S+)$", job, re.M):
+                self.assertEqual(repo, "supervizio/agent", name)
 
     def test_only_packages_leave(self):
         paths = re.findall(r"uses: actions/upload-artifact@.*?\n(?:\s+.*\n)*?\s+path: (\S+)", self.workflow)
@@ -118,7 +126,7 @@ class AgentSolarishPackaging(unittest.TestCase):
                 self.assertIn(f'"artifact":"supervizio-{platform}"', entry.group(0))
                 self.assertIn(f'"tests_artifact":"solarish-tests-{platform}"', entry.group(0))
         job = self.jobs["solarish"]
-        self.assertEqual(job.count("uses: actions/download-artifact@"), 2)
+        self.assertEqual(job.count("uses: actions/download-artifact@"), 3)
         self.assertNotRegex(job, r"\bgo (build|test)\b|cargo |go\.dev/dl")
 
     def test_the_guests_run_agents_packaging_script_and_only_packages_leave(self):

@@ -135,8 +135,9 @@ which the caller reads. Workflows start from `permissions: {}` (or
   `git fetch -q` ([`scripts/fetch-source.sh`](scripts/fetch-source.sh)), not
   `actions/checkout`, whose detached checkout prints the commit subject; the
   token is a one-shot header, never written to `.git/config`, its base64 form
-  masked. agent's packaging reads a sparse checkout of its packaging tree
-  (`setup/`, the guest wrappers), never its Go sources;
+  masked. agent's packaging never checks agent out: it downloads the
+  `packaging-inputs-<group>` artifact agent built from its explicit file list
+  (the packaging scripts, the guest wrappers), never its Go sources;
 - no build log: every build command runs through
   [`scripts/quiet.sh`](scripts/quiet.sh), which prints the step and its
   verdict only. Reproduce a red build from the private repository;

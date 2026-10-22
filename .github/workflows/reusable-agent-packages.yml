@@ -46,13 +46,12 @@
 # WHAT IT READS FROM agent, and nothing more:
 #   * the cross-built binaries, downloaded from the agent run that asked, and
 #     for illumos/Solaris the `go test -c` binaries (`solarish-tests-*`);
-#   * a SPARSE checkout of the requesting commit: `setup/`,
-#     `examples/config.yaml`, `LICENSE`, `e2e/test-install.ps1`,
-#     `.github/scripts/bsd-package-in-guest.sh` and
-#     `.github/scripts/solarish-package-in-guest.sh`. All but the last two
-#     already ship in every release as `e2e-kit.tar.gz`; those two are the
-#     packaging wrappers the guests run. None of agent's Go sources are ever
-#     checked out here.
+#   * `packaging-inputs-<bsd|solarish|desktop>`, an artifact of that same run:
+#     one tar of the files agent lists, file by file, for that group (its
+#     .github/packaging-inputs.txt), at the requesting commit -- the build-pkg
+#     scripts, init files, example config, licence, install scripts and the
+#     guest wrappers. agent is never checked out here: no Go source, no
+#     maintainer notes, no commit subject in the log.
 #   These scripts are not vendored into this repository on purpose: they
 #   package the tree they sit in, so they are read at the commit being
 #   packaged, and a copy here would drift from the build-pkg.sh it wraps.
@@ -63,15 +62,14 @@
 #   * No personal token. The jobs that read agent run in the `private-source`
 #     ENVIRONMENT (deployment branches: `main` only), the only place the
 #     kodflow-ci GitHub App's key (CI_APP_PRIVATE_KEY, with vars.CI_APP_CLIENT_ID) can
-#     be read, and mint there a token for supervizio/agent alone, contents:
-#     read + actions: read, revoked when the job ends. Only the two steps that
-#     need it read it (checkout, download); it is never exported to the job,
-#     never persisted in the checkout (persist-credentials: false), never
-#     synced into a guest.
+#     be read, and mint there a token for supervizio/agent alone, actions:
+#     read, revoked when the job ends. Only the download steps read it; it is
+#     never exported to the job, never written to disk, never synced into a
+#     guest.
 #   * The requested commit, run id and request id are validated in `admit`
 #     before any job holds the token; the repository is not an input at all.
 #   * Only packages leave: each upload is the package directory, nothing of
-#     the checkout. No step prints a source file. The illumos/Solaris guest
+#     the packaging inputs. No step prints a source file. The illumos/Solaris guest
 #     keeps its detailed output inside the guest (/var/tmp, never synced
 #     back); the log shows its `=== ` stage lines and the verdict only.
 #   * Nothing here writes to agent: the verdict is this run's conclusion,
@@ -253,23 +251,25 @@ jobs:
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: supervizio
           repositories: agent
-          permission-contents: read
           permission-actions: read
 
-      - name: Sparse checkout of agent's packaging tree
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download agent's packaging inputs
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
+          name: packaging-inputs-bsd
+          path: .packaging-inputs
           repository: supervizio/agent
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ steps.app.outputs.token }}
-          # The workspace is synced wholesale into the guest: a persisted
-          # credential would travel with it.
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /setup/
-            /examples/config.yaml
-            /.github/scripts/bsd-package-in-guest.sh
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      # The tar keeps the scripts' modes; removed before the workspace is
+      # synced into a guest.
+      - name: Unpack agent's packaging inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xf .packaging-inputs/packaging-inputs.tar -C .
+          rm -rf .packaging-inputs
 
       - name: Download the cross-built binary from the agent run
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -394,24 +394,25 @@ jobs:
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: supervizio
           repositories: agent
-          permission-contents: read
           permission-actions: read
 
-      - name: Sparse checkout of agent's packaging tree
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download agent's packaging inputs
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
+          name: packaging-inputs-solarish
+          path: .packaging-inputs
           repository: supervizio/agent
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ steps.app.outputs.token }}
-          # The workspace is synced wholesale into the guest.
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          # LICENSE: the package ships it (build-pkg.sh's license action).
-          sparse-checkout: |
-            /setup/
-            /examples/config.yaml
-            /LICENSE
-            /.github/scripts/solarish-package-in-guest.sh
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      # The tar keeps the scripts' modes; removed before the workspace is
+      # synced into a guest.
+      - name: Unpack agent's packaging inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xf .packaging-inputs/packaging-inputs.tar -C .
+          rm -rf .packaging-inputs
 
       - name: Download the cross-built binary from the agent run
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -535,21 +536,25 @@ jobs:
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: supervizio
           repositories: agent
-          permission-contents: read
           permission-actions: read
 
-      - name: Sparse checkout of agent's packaging tree
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download agent's packaging inputs
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
+          name: packaging-inputs-desktop
+          path: .packaging-inputs
           repository: supervizio/agent
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ steps.app.outputs.token }}
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /setup/
-            /examples/config.yaml
-            /e2e/test-install.ps1
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      # The tar keeps the scripts' modes; removed before the workspace is
+      # synced into a guest.
+      - name: Unpack agent's packaging inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xf .packaging-inputs/packaging-inputs.tar -C .
+          rm -rf .packaging-inputs
 
       - name: Download the cross-built binary from the agent run
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -683,20 +688,25 @@ jobs:
           private-key: ${{ secrets.CI_APP_PRIVATE_KEY }}
           owner: supervizio
           repositories: agent
-          permission-contents: read
           permission-actions: read
 
-      - name: Sparse checkout of agent's packaging tree
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download agent's packaging inputs
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
+          name: packaging-inputs-desktop
+          path: .packaging-inputs
           repository: supervizio/agent
-          ref: ${{ env.SOURCE_SHA }}
-          token: ${{ steps.app.outputs.token }}
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /setup/init/windows/
-            /e2e/test-install.ps1
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ steps.app.outputs.token }}
+
+      # The tar keeps the scripts' modes; removed before the workspace is
+      # synced into a guest.
+      - name: Unpack agent's packaging inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -xf .packaging-inputs/packaging-inputs.tar -C .
+          rm -rf .packaging-inputs
 
       - name: Download the cross-built binary from the agent run
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
